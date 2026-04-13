@@ -880,6 +880,13 @@ class Knowledgebase(DataBaseModel):
 
     status = CharField(max_length=1, null=True, help_text="is it validate(0: wasted, 1: validate)", default="1", index=True)
 
+    # PolyU extension fields
+    subject_category = CharField(max_length=100, null=True, help_text="subject category for PolyU", index=True)
+    course_code = CharField(max_length=50, null=True, help_text="course code for PolyU", index=True)
+    dept_code = CharField(max_length=50, null=True, help_text="department code for PolyU", index=True)
+    visibility = CharField(max_length=20, null=True, default="private", help_text="visibility: private|department|public", index=True)
+    owner_id = CharField(max_length=100, null=True, help_text="PolyU owner user ID", index=True)
+
     def __str__(self):
         return self.name
 

@@ -99,6 +99,26 @@ def _load_user():
     if not authorization:
         return None
 
+    # PolyU Keycloak SSO: Try Keycloak JWT verification first
+    try:
+        from api.utils.polyu_keycloak import is_keycloak_enabled, verify_keycloak_token, get_or_create_user_from_keycloak
+
+        if is_keycloak_enabled():
+            # Extract token from "Bearer <token>" or raw token
+            token_str = authorization
+            if authorization.lower().startswith("bearer "):
+                token_str = authorization[7:].strip()
+
+            keycloak_decoded = verify_keycloak_token(token_str)
+            if keycloak_decoded:
+                user = get_or_create_user_from_keycloak(keycloak_decoded)
+                if user:
+                    g.user = user
+                    return user
+    except Exception as e_keycloak:
+        logging.debug(f"PolyU Keycloak auth attempt failed: {e_keycloak}")
+        # Fall through to native authentication
+
     try:
         access_token = str(jwt.loads(authorization))
 
