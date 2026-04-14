@@ -1,4 +1,4 @@
--- PolyU Extension: Add fields to knowledgebase table
+-- Platform Extension: Add fields to knowledgebase table
 -- Run this migration after deploying RAGFlow with the updated db_models.py
 
 -- Add subject category for knowledge base classification
@@ -17,6 +17,6 @@ CREATE INDEX IF NOT EXISTS idx_knowledgebase_dept_code ON knowledgebase(dept_cod
 ALTER TABLE knowledgebase ADD COLUMN IF NOT EXISTS visibility VARCHAR(20) DEFAULT 'private';
 CREATE INDEX IF NOT EXISTS idx_knowledgebase_visibility ON knowledgebase(visibility);
 
--- Add owner ID for PolyU user association
+-- Add owner ID for platform user association
 ALTER TABLE knowledgebase ADD COLUMN IF NOT EXISTS owner_id VARCHAR(100);
 CREATE INDEX IF NOT EXISTS idx_knowledgebase_owner_id ON knowledgebase(owner_id);

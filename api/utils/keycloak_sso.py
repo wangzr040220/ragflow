@@ -1,11 +1,11 @@
 """
-PolyU Keycloak JWT Authentication Module for RAGFlow
+Keycloak SSO JWT Authentication Module for RAGFlow
 
 This module provides Keycloak OIDC JWT token verification for RAGFlow.
 It allows users authenticated via Keycloak SSO to access RAGFlow API seamlessly.
 
 Architecture:
-- When POLYU_KEYCLOAK_ENABLED is True, _load_user() will try Keycloak JWT
+- When KEYCLOAK_SSO_ENABLED is True, _load_user() will try Keycloak JWT
   verification before falling back to RAGFlow's native itsdangerous token.
 - JWT tokens are verified using Keycloak's JWKS public keys.
 - Verified users are matched to RAGFlow users by email.
@@ -36,7 +36,7 @@ def _get_config(key: str, default: str = "") -> str:
     """Get configuration from environment variables.
 
     NOTE: RAGFlow does not have a unified config framework like Dify's dify_config,
-    so we read directly from os.environ. All POLYU_KEYCLOAK_* env vars are documented
+    so we read directly from os.environ. All KEYCLOAK_SSO_* env vars are documented
     in docs/role-extraction.md and must be set consistently across all services.
     """
     return os.environ.get(key, default)
@@ -44,7 +44,7 @@ def _get_config(key: str, default: str = "") -> str:
 
 def is_keycloak_enabled() -> bool:
     """Check if Keycloak authentication is enabled."""
-    return _get_config("POLYU_KEYCLOAK_ENABLED", "false").lower() in ("true", "1", "yes")
+    return _get_config("KEYCLOAK_SSO_ENABLED", "false").lower() in ("true", "1", "yes")
 
 
 def _fetch_jwks(jwks_uri: str) -> list[dict[str, Any]]:
@@ -76,12 +76,12 @@ def _fetch_jwks(jwks_uri: str) -> list[dict[str, Any]]:
                 "fetched_at": time.time(),
             }
 
-            logger.info("PolyU Keycloak: Fetched %d JWKS keys from %s", len(keys), jwks_uri)
+            logger.info("Keycloak SSO: Fetched %d JWKS keys from %s", len(keys), jwks_uri)
             return keys
         except Exception as e:
-            logger.error("PolyU Keycloak: Failed to fetch JWKS from %s: %s", jwks_uri, e)
+            logger.error("Keycloak SSO: Failed to fetch JWKS from %s: %s", jwks_uri, e)
             if cached:
-                logger.warning("PolyU Keycloak: Using expired cached JWKS keys")
+                logger.warning("Keycloak SSO: Using expired cached JWKS keys")
                 return cached["keys"]
             raise
 
@@ -98,12 +98,12 @@ def verify_keycloak_token(token: str) -> dict[str, Any] | None:
     if not is_keycloak_enabled():
         return None
 
-    jwks_uri = _get_config("POLYU_KEYCLOAK_JWKS_URI")
-    issuer = _get_config("POLYU_KEYCLOAK_ISSUER")
-    client_id = _get_config("POLYU_KEYCLOAK_CLIENT_ID", "ragflow-console")
+    jwks_uri = _get_config("KEYCLOAK_SSO_JWKS_URI")
+    issuer = _get_config("KEYCLOAK_SSO_ISSUER")
+    client_id = _get_config("KEYCLOAK_SSO_CLIENT_ID", "ragflow-console")
 
     if not jwks_uri or not issuer:
-        logger.debug("PolyU Keycloak: JWKS URI or Issuer not configured, skipping")
+        logger.debug("Keycloak SSO: JWKS URI or Issuer not configured, skipping")
         return None
 
     try:
@@ -112,7 +112,7 @@ def verify_keycloak_token(token: str) -> dict[str, Any] | None:
         kid = unverified_header.get("kid")
 
         if not kid:
-            logger.debug("PolyU Keycloak: No kid in JWT header, not a Keycloak token")
+            logger.debug("Keycloak SSO: No kid in JWT header, not a Keycloak token")
             return None
 
         # Fetch JWKS keys
@@ -126,7 +126,7 @@ def verify_keycloak_token(token: str) -> dict[str, Any] | None:
                 break
 
         if not matching_key:
-            logger.warning("PolyU Keycloak: No matching key found for kid=%s", kid)
+            logger.warning("Keycloak SSO: No matching key found for kid=%s", kid)
             return None
 
         # Construct public key from JWK
@@ -142,31 +142,31 @@ def verify_keycloak_token(token: str) -> dict[str, Any] | None:
         )
 
         logger.info(
-            "PolyU Keycloak: Successfully verified token for user %s (email=%s)",
+            "Keycloak SSO: Successfully verified token for user %s (email=%s)",
             decoded.get("sub"),
             decoded.get("email", "N/A"),
         )
         return decoded
 
     except jwt.ExpiredSignatureError:
-        logger.debug("PolyU Keycloak: Token has expired")
+        logger.debug("Keycloak SSO: Token has expired")
         return None
     except jwt.InvalidAudienceError:
-        logger.debug("PolyU Keycloak: Invalid audience")
+        logger.debug("Keycloak SSO: Invalid audience")
         return None
     except jwt.InvalidIssuerError:
-        logger.debug("PolyU Keycloak: Invalid issuer")
+        logger.debug("Keycloak SSO: Invalid issuer")
         return None
     except jwt.DecodeError as e:
-        logger.debug("PolyU Keycloak: Token decode error: %s", e)
+        logger.debug("Keycloak SSO: Token decode error: %s", e)
         return None
     except Exception as e:
-        logger.warning("PolyU Keycloak: Unexpected error during token verification: %s", e)
+        logger.warning("Keycloak SSO: Unexpected error during token verification: %s", e)
         return None
 
 
 def extract_keycloak_roles(decoded_token: dict[str, Any]) -> list[str]:
-    """Extract PolyU roles from Keycloak token.
+    """Extract roles from Keycloak token.
 
     Keycloak realm roles are in: realm_access.roles
     Keycloak client roles are in: resource_access.<client_id>.roles
@@ -189,8 +189,8 @@ def extract_keycloak_roles(decoded_token: dict[str, Any]) -> list[str]:
     return roles
 
 
-def get_polyu_role(roles: list[str]) -> str:
-    """Determine the PolyU platform role from Keycloak roles.
+def get_platform_role(roles: list[str]) -> str:
+    """Determine the platform role from Keycloak roles.
 
     Priority: super_admin > admin > teacher > student
 
@@ -207,7 +207,7 @@ def get_polyu_role(roles: list[str]) -> str:
     return "student"  # Default role
 
 
-def get_or_create_user_from_keycloak(decoded_token: dict[str, Any]):
+def get_or_create_user_from_sso(decoded_token: dict[str, Any]):
     """Get or create a RAGFlow user from a verified Keycloak token.
 
     Args:
@@ -218,7 +218,7 @@ def get_or_create_user_from_keycloak(decoded_token: dict[str, Any]):
     """
     email = decoded_token.get("email")
     if not email:
-        logger.warning("PolyU Keycloak: No email in token, cannot match user")
+        logger.warning("Keycloak SSO: No email in token, cannot match user")
         return None
 
     name = decoded_token.get("name") or decoded_token.get("preferred_username") or email.split("@")[0]
@@ -229,17 +229,17 @@ def get_or_create_user_from_keycloak(decoded_token: dict[str, Any]):
         user = users[0]
         # Check if user is active
         if hasattr(user, 'status') and user.status == StatusEnum.VALID.value:
-            logger.info("PolyU Keycloak: Found existing user for %s", email)
+            logger.info("Keycloak SSO: Found existing user for %s", email)
             return user
         else:
-            logger.warning("PolyU Keycloak: User %s exists but status is not VALID", email)
+            logger.warning("Keycloak SSO: User %s exists but status is not VALID", email)
             return None
 
     # Auto-create user if enabled
-    auto_create = _get_config("POLYU_KEYCLOAK_AUTO_CREATE_ACCOUNT", "true").lower() in ("true", "1", "yes")
+    auto_create = _get_config("KEYCLOAK_SSO_AUTO_CREATE_ACCOUNT", "true").lower() in ("true", "1", "yes")
     if not auto_create:
         logger.warning(
-            "PolyU Keycloak: No user found for %s and auto-create is disabled",
+            "Keycloak SSO: No user found for %s and auto-create is disabled",
             email,
         )
         return None
@@ -263,12 +263,12 @@ def get_or_create_user_from_keycloak(decoded_token: dict[str, Any]):
         # Query the newly created user
         user = UserService.filter_by_id(user_id)
         if user:
-            logger.info("PolyU Keycloak: Auto-created user for %s", email)
+            logger.info("Keycloak SSO: Auto-created user for %s", email)
             return user
 
-        logger.error("PolyU Keycloak: Failed to query newly created user for %s", email)
+        logger.error("Keycloak SSO: Failed to query newly created user for %s", email)
         return None
 
     except Exception as e:
-        logger.error("PolyU Keycloak: Failed to create user for %s: %s", email, e)
+        logger.error("Keycloak SSO: Failed to create user for %s: %s", email, e)
         return None

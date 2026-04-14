@@ -1,12 +1,12 @@
 """
-PolyU Knowledge Base Permission Enhancement
+Knowledge Base Permission Enhancement
 
-Extends RAGFlow's dataset API to support PolyU-specific fields:
+Extends RAGFlow's dataset API to support platform-specific fields:
 - subject_category: subject classification
 - course_code: associated course code
 - dept_code: department code
 - visibility: private|department|public
-- owner_id: PolyU user ID
+- owner_id: owner user ID
 
 Also provides document parsing completion callback to BFF.
 """
@@ -21,16 +21,16 @@ from api.db.services.knowledgebase_service import KnowledgebaseService
 logger = logging.getLogger(__name__)
 
 # BFF callback URL for document parsing completion
-POLYU_BFF_CALLBACK_URL = os.environ.get("POLYU_BFF_CALLBACK_URL", "")
-POLYU_BFF_WEBHOOK_SECRET = os.environ.get("POLYU_BFF_WEBHOOK_SECRET", "")
+BFF_CALLBACK_URL = os.environ.get("BFF_CALLBACK_URL", "")
+BFF_WEBHOOK_SECRET = os.environ.get("BFF_WEBHOOK_SECRET", "")
 
 
-def update_polyu_fields(kb_id: str, fields: dict) -> bool:
+def update_extension_fields(kb_id: str, fields: dict) -> bool:
     """
-    Update PolyU extension fields on a knowledge base.
+    Update extension fields on a knowledge base.
 
     :param kb_id: Knowledge base ID
-    :param fields: Dict with PolyU extension fields
+    :param fields: Dict with extension fields
     :return: True if successful
     """
     allowed_fields = {
@@ -45,12 +45,12 @@ def update_polyu_fields(kb_id: str, fields: dict) -> bool:
     return KnowledgebaseService.update_by_id(kb_id, update_data)
 
 
-def check_polyu_visibility(kb_id: str, user_id: str, user_dept_code: str = "") -> bool:
+def check_visibility(kb_id: str, user_id: str, user_dept_code: str = "") -> bool:
     """
-    Check if a user can access a knowledge base based on PolyU visibility rules.
+    Check if a user can access a knowledge base based on visibility rules.
 
     :param kb_id: Knowledge base ID
-    :param user_id: PolyU user ID
+    :param user_id: User ID
     :param user_dept_code: User's department code
     :return: True if access is allowed
     """
@@ -95,8 +95,8 @@ def notify_document_parse_complete(kb_id: str, doc_id: str, doc_name: str,
     :param error_message: Error message if failed
     :return: True if notification was sent successfully
     """
-    if not POLYU_BFF_CALLBACK_URL:
-        logger.debug("POLYU_BFF_CALLBACK_URL not configured, skipping notification")
+    if not BFF_CALLBACK_URL:
+        logger.debug("BFF_CALLBACK_URL not configured, skipping notification")
         return True
 
     payload = {
@@ -113,12 +113,12 @@ def notify_document_parse_complete(kb_id: str, doc_id: str, doc_name: str,
         "Content-Type": "application/json",
     }
 
-    if POLYU_BFF_WEBHOOK_SECRET:
-        headers["X-Webhook-Secret"] = POLYU_BFF_WEBHOOK_SECRET
+    if BFF_WEBHOOK_SECRET:
+        headers["X-Webhook-Secret"] = BFF_WEBHOOK_SECRET
 
     try:
         resp = requests.post(
-            POLYU_BFF_CALLBACK_URL,
+            BFF_CALLBACK_URL,
             json=payload,
             headers=headers,
             timeout=10,
