@@ -17,12 +17,19 @@ import os
 import threading
 import time
 from typing import Any
+from urllib.parse import urljoin
 
 import jwt
 import requests
 
+from api.db import UserTenantRole
+from api.db.services.file_service import FileService
+from api.db.services.llm_service import get_init_tenant_llm
+from api.db.services.tenant_llm_service import TenantLLMService
+from api.db.services.user_service import UserService, TenantService, UserTenantService
+from common import settings
 from common.constants import StatusEnum
-from api.db.services import UserService
+from common.misc_utils import get_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +52,56 @@ def _get_config(key: str, default: str = "") -> str:
 def is_keycloak_enabled() -> bool:
     """Check if Keycloak authentication is enabled."""
     return _get_config("KEYCLOAK_SSO_ENABLED", "false").lower() in ("true", "1", "yes")
+
+
+def _get_oauth_config() -> dict[str, Any]:
+    oauth_config = getattr(settings, "OAUTH_CONFIG", {}) or {}
+    keycloak_config = oauth_config.get("keycloak", {})
+    return keycloak_config if isinstance(keycloak_config, dict) else {}
+
+
+def _get_keycloak_token_url() -> str:
+    oauth_config = _get_oauth_config()
+    token_url = oauth_config.get("token_url")
+    if token_url:
+        return token_url
+
+    issuer = _get_config("KEYCLOAK_SSO_ISSUER")
+    if issuer:
+        normalized_issuer = issuer.rstrip("/") + "/"
+        return urljoin(normalized_issuer, "protocol/openid-connect/token")
+
+    return ""
+
+
+def _get_keycloak_client_credentials() -> tuple[str, str]:
+    oauth_config = _get_oauth_config()
+    client_id = oauth_config.get("client_id") or "ragflow-console"
+    client_secret = oauth_config.get("client_secret") or ""
+    return client_id, client_secret
+
+
+def _get_allowed_client_ids() -> list[str]:
+    """Return the allowed Keycloak client ids for SmartAA SSO tokens.
+
+    The env keeps backward compatibility with the original single-client setup,
+    but now supports a comma-separated allowlist so tokens issued for the admin
+    console can also open the embedded RAGFlow workspace without a second login.
+    """
+    raw_value = _get_config("KEYCLOAK_SSO_CLIENT_ID", "ragflow-console")
+    return [item.strip() for item in raw_value.split(",") if item.strip()]
+
+
+def _is_client_allowed(decoded: dict[str, Any], allowed_client_ids: list[str]) -> bool:
+    """Accept tokens whose audience or azp matches one of the allowed clients."""
+    if not allowed_client_ids:
+        return True
+
+    audience = decoded.get("aud")
+    audiences = audience if isinstance(audience, list) else [audience] if audience else []
+    azp = decoded.get("azp")
+
+    return bool(set(audiences).intersection(allowed_client_ids)) or azp in allowed_client_ids
 
 
 def _fetch_jwks(jwks_uri: str) -> list[dict[str, Any]]:
@@ -100,7 +157,7 @@ def verify_keycloak_token(token: str) -> dict[str, Any] | None:
 
     jwks_uri = _get_config("KEYCLOAK_SSO_JWKS_URI")
     issuer = _get_config("KEYCLOAK_SSO_ISSUER")
-    client_id = _get_config("KEYCLOAK_SSO_CLIENT_ID", "ragflow-console")
+    allowed_client_ids = _get_allowed_client_ids()
 
     if not jwks_uri or not issuer:
         logger.debug("Keycloak SSO: JWKS URI or Issuer not configured, skipping")
@@ -137,9 +194,18 @@ def verify_keycloak_token(token: str) -> dict[str, Any] | None:
             token,
             public_key,
             algorithms=["RS256"],
-            audience=client_id,
             issuer=issuer,
+            options={"verify_aud": False},
         )
+
+        if not _is_client_allowed(decoded, allowed_client_ids):
+            logger.debug(
+                "Keycloak SSO: Token client is not allowed. aud=%s azp=%s allowed=%s",
+                decoded.get("aud"),
+                decoded.get("azp"),
+                allowed_client_ids,
+            )
+            return None
 
         logger.info(
             "Keycloak SSO: Successfully verified token for user %s (email=%s)",
@@ -151,9 +217,6 @@ def verify_keycloak_token(token: str) -> dict[str, Any] | None:
     except jwt.ExpiredSignatureError:
         logger.debug("Keycloak SSO: Token has expired")
         return None
-    except jwt.InvalidAudienceError:
-        logger.debug("Keycloak SSO: Invalid audience")
-        return None
     except jwt.InvalidIssuerError:
         logger.debug("Keycloak SSO: Invalid issuer")
         return None
@@ -162,6 +225,56 @@ def verify_keycloak_token(token: str) -> dict[str, Any] | None:
         return None
     except Exception as e:
         logger.warning("Keycloak SSO: Unexpected error during token verification: %s", e)
+        return None
+
+
+def authenticate_keycloak_user(username: str, password: str) -> dict[str, Any] | None:
+    """Authenticate a user against Keycloak using username/password."""
+    if not is_keycloak_enabled():
+        return None
+
+    token_url = _get_keycloak_token_url()
+    client_id, client_secret = _get_keycloak_client_credentials()
+
+    if not token_url or not client_id:
+        logger.warning("Keycloak SSO: token endpoint or client id is not configured")
+        return None
+
+    try:
+        payload = {
+            "grant_type": "password",
+            "client_id": client_id,
+            "username": username,
+            "password": password,
+            "scope": "openid email profile",
+        }
+        if client_secret:
+            payload["client_secret"] = client_secret
+
+        response = requests.post(token_url, data=payload, timeout=10)
+        if response.status_code != 200:
+            logger.info(
+                "Keycloak SSO: Password authentication failed for %s with status %s",
+                username,
+                response.status_code,
+            )
+            return None
+
+        token_payload = response.json()
+        access_token = token_payload.get("access_token")
+        if not access_token:
+            logger.warning("Keycloak SSO: Keycloak token response for %s has no access_token", username)
+            return None
+
+        decoded_token = verify_keycloak_token(access_token)
+        if not decoded_token:
+            logger.warning("Keycloak SSO: access_token verification failed for %s", username)
+            return None
+
+        token_payload["decoded_access_token"] = decoded_token
+        return token_payload
+    except Exception as e:
+        logger.warning("Keycloak SSO: password authentication error for %s: %s", username, e)
         return None
 
 
@@ -207,6 +320,50 @@ def get_platform_role(roles: list[str]) -> str:
     return "student"  # Default role
 
 
+def _ensure_user_bootstrap(user: Any) -> bool:
+    """Ensure SSO users always have a usable tenant workspace."""
+    user_id = getattr(user, "id", None)
+    if not user_id:
+        return False
+
+    nickname = getattr(user, "nickname", None) or "User"
+    tenant_exists = TenantService.get_or_none(id=user_id) is not None
+    user_tenant_exists = UserTenantService.filter_by_tenant_and_user_id(user_id, user_id) is not None
+
+    try:
+        if not tenant_exists:
+            TenantService.insert(
+                id=user_id,
+                name=f"{nickname}‘s Kingdom",
+                llm_id=settings.CHAT_MDL,
+                embd_id=settings.EMBEDDING_MDL,
+                asr_id=settings.ASR_MDL,
+                parser_ids=settings.PARSERS,
+                img2txt_id=settings.IMAGE2TEXT_MDL,
+                rerank_id=settings.RERANK_MDL,
+            )
+
+        if not user_tenant_exists:
+            UserTenantService.insert(
+                tenant_id=user_id,
+                user_id=user_id,
+                invited_by=user_id,
+                role=UserTenantRole.OWNER,
+            )
+
+        if not TenantLLMService.query(tenant_id=user_id):
+            tenant_llm = get_init_tenant_llm(user_id)
+            if tenant_llm:
+                TenantLLMService.insert_many(tenant_llm)
+
+        # Ensure root folder exists for this tenant.
+        FileService.get_root_folder(user_id)
+        return True
+    except Exception as e:
+        logger.error("Keycloak SSO: Failed to bootstrap tenant for user %s: %s", user_id, e)
+        return False
+
+
 def get_or_create_user_from_sso(decoded_token: dict[str, Any]):
     """Get or create a RAGFlow user from a verified Keycloak token.
 
@@ -229,6 +386,7 @@ def get_or_create_user_from_sso(decoded_token: dict[str, Any]):
         user = users[0]
         # Check if user is active
         if hasattr(user, 'status') and user.status == StatusEnum.VALID.value:
+            _ensure_user_bootstrap(user)
             logger.info("Keycloak SSO: Found existing user for %s", email)
             return user
         else:
@@ -245,9 +403,6 @@ def get_or_create_user_from_sso(decoded_token: dict[str, Any]):
         return None
 
     try:
-        from common.misc_utils import get_uuid
-        import hashlib
-
         # Create user with a random access token
         access_token = get_uuid()
         user_id = get_uuid()
@@ -263,6 +418,7 @@ def get_or_create_user_from_sso(decoded_token: dict[str, Any]):
         # Query the newly created user
         user = UserService.filter_by_id(user_id)
         if user:
+            _ensure_user_bootstrap(user)
             logger.info("Keycloak SSO: Auto-created user for %s", email)
             return user
 

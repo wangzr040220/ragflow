@@ -45,6 +45,7 @@ from api.utils.api_utils import (
     validate_request,
 )
 from api.utils.crypt import decrypt
+from api.utils.keycloak_sso import authenticate_keycloak_user, get_or_create_user_from_sso, is_keycloak_enabled
 from api.utils.tenant_utils import ensure_tenant_model_id_for_params
 from rag.utils.redis_conn import REDIS_CONN
 from api.apps import login_required, current_user, login_user, logout_user
@@ -100,6 +101,50 @@ async def login():
 
     email = json_body.get("email", "")
 
+    password = json_body.get("password")
+    try:
+        password = decrypt(password)
+    except BaseException:
+        return get_json_result(data=False, code=RetCode.SERVER_ERROR, message="Fail to crypt password")
+
+    keycloak_password = password
+    try:
+        keycloak_password = base64.b64decode(password).decode("utf-8")
+    except Exception:
+        keycloak_password = password
+
+    if is_keycloak_enabled() and email and password:
+        keycloak_auth = authenticate_keycloak_user(email, keycloak_password)
+        if keycloak_auth:
+            decoded_token = keycloak_auth.get("decoded_access_token")
+            user = get_or_create_user_from_sso(decoded_token) if decoded_token else None
+
+            if not user:
+                return get_json_result(
+                    data=False,
+                    code=RetCode.AUTHENTICATION_ERROR,
+                    message="Email and password do not match!",
+                )
+
+            if user and hasattr(user, 'is_active') and user.is_active == "0":
+                return get_json_result(
+                    data=False,
+                    code=RetCode.FORBIDDEN,
+                    message="This account has been disabled, please contact the administrator!",
+                )
+
+            user.access_token = get_uuid()
+            login_user(user)
+            user.update_time = current_timestamp()
+            user.update_date = datetime_format(datetime.now())
+            user.last_login_time = get_format_time()
+            user.save()
+            return await construct_response(
+                data=user.to_json(),
+                auth=user.get_id(),
+                message="Welcome back!",
+            )
+
     users = UserService.query(email=email)
     if not users:
         return get_json_result(
@@ -107,12 +152,6 @@ async def login():
             code=RetCode.AUTHENTICATION_ERROR,
             message=f"Email: {email} is not registered!",
         )
-
-    password = json_body.get("password")
-    try:
-        password = decrypt(password)
-    except BaseException:
-        return get_json_result(data=False, code=RetCode.SERVER_ERROR, message="Fail to crypt password")
 
     user = UserService.query_user(email, password)
 
@@ -146,16 +185,7 @@ async def get_login_channels():
     Get all supported authentication channels.
     """
     try:
-        channels = []
-        for channel, config in settings.OAUTH_CONFIG.items():
-            channels.append(
-                {
-                    "channel": channel,
-                    "display_name": config.get("display_name", channel.title()),
-                    "icon": config.get("icon", "sso"),
-                }
-            )
-        return get_json_result(data=channels)
+        return get_json_result(data=[])
     except Exception as e:
         logging.exception(e)
         return get_json_result(data=[], message=f"Load channels failure, error: {str(e)}", code=RetCode.EXCEPTION_ERROR)
@@ -506,6 +536,73 @@ async def log_out():
     current_user.save()
     logout_user()
     return get_json_result(data=True)
+
+
+@manager.route("/session", methods=["POST"])  # noqa: F821
+async def create_sso_session():
+    """
+    Exchange a Keycloak access token for a durable RAGFlow auth token.
+    """
+    req = await get_request_json()
+    token = (req.get("token") or "").strip()
+
+    if not token:
+        return get_json_result(
+            data=False,
+            code=RetCode.ARGUMENT_ERROR,
+            message="token is required",
+        )
+
+    try:
+        from api.utils.keycloak_sso import (
+            get_or_create_user_from_sso,
+            is_keycloak_enabled,
+            verify_keycloak_token,
+        )
+
+        if not is_keycloak_enabled():
+            return get_json_result(
+                data=False,
+                code=RetCode.OPERATING_ERROR,
+                message="Keycloak SSO is disabled",
+            )
+
+        decoded_token = verify_keycloak_token(token)
+        if not decoded_token:
+            return get_json_result(
+                data=False,
+                code=RetCode.AUTHENTICATION_ERROR,
+                message="Unauthorized!",
+            )
+
+        user = get_or_create_user_from_sso(decoded_token)
+        if not user:
+            return get_json_result(
+                data=False,
+                code=RetCode.AUTHENTICATION_ERROR,
+                message="Unauthorized!",
+            )
+
+        if (
+            not user.access_token
+            or not user.access_token.strip()
+            or user.access_token.startswith("INVALID_")
+        ):
+            user.access_token = get_uuid()
+            user.update_time = current_timestamp()
+            user.update_date = datetime_format(datetime.now())
+            user.save()
+
+        return get_json_result(
+            data={
+                "auth": user.get_id(),
+                "email": user.email,
+                "user_id": user.id,
+            }
+        )
+    except Exception as e:
+        logging.exception(e)
+        return server_error_response(e)
 
 
 @manager.route("/setting", methods=["POST"])  # noqa: F821
